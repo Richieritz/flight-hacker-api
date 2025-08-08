@@ -8,8 +8,17 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ENV
 const AMADEUS_KEY = process.env.AMADEUS_KEY;
 const AMADEUS_SECRET = process.env.AMADEUS_SECRET;
+
+// helpers
+function parseISODurationToMinutes(iso) {
+  const m = String(iso).match(/PT(?:(\d+)H)?(?:(\d+)M)?/);
+  const h = m?.[1] ? parseInt(m[1], 10) : 0;
+  const min = m?.[2] ? parseInt(m[2], 10) : 0;
+  return h * 60 + min;
+}
 
 async function getAccessToken() {
   const res = await ky.post('https://test.api.amadeus.com/v1/security/oauth2/token', {
@@ -23,13 +32,7 @@ async function getAccessToken() {
   return res.access_token;
 }
 
-function parseISODurationToMinutes(iso) {
-  const m = String(iso).match(/PT(?:(\d+)H)?(?:(\d+)M)?/);
-  const h = m?.[1] ? parseInt(m[1], 10) : 0;
-  const min = m?.[2] ? parseInt(m[2], 10) : 0;
-  return h * 60 + min;
-}
-
+// core search
 async function searchAmadeus(q) {
   const token = await getAccessToken();
 
@@ -39,16 +42,24 @@ async function searchAmadeus(q) {
     departureDate: format(new Date(q.start), 'yyyy-MM-dd'),
     adults: String(q.pax || 1),
     currencyCode: 'USD',
-    max: '30',
-    sort: q.optimize === 'shortest' ? 'DURATION' : 'PRICE'
+    max: '30'
+    // no sort param – API doesn't accept it
   });
+  if (q.end) params.set('returnDate', format(new Date(q.end), 'yyyy-MM-dd'));
 
-  const res = await ky.get(`https://test.api.amadeus.com/v2/shopping/flight-offers?${params}`, {
-    headers: { Authorization: `Bearer ${token}` }
+  const res = await ky.get('https://test.api.amadeus.com/v2/shopping/flight-offers', {
+    headers: { Authorization: `Bearer ${token}` },
+    searchParams: params
   }).json();
 
+  if (res.errors?.length) {
+    const msg = res.errors.map(e => e.detail || e.title || JSON.stringify(e)).join(' | ');
+    throw new Error(`Amadeus error: ${msg}`);
+  }
+
   const data = Array.isArray(res.data) ? res.data : [];
-  return data.map((offer, idx) => {
+
+  const mapped = data.map((offer, idx) => {
     const itin = offer.itineraries[0];
     const legs = itin.segments.map(seg => ({
       from: seg.departure.iataCode,
@@ -71,8 +82,29 @@ async function searchAmadeus(q) {
       notes: []
     };
   });
+
+  // local sort
+  const optimize = q.optimize || 'balanced';
+  if (optimize === 'shortest') mapped.sort((a, b) => a.totalDurationMin - b.totalDurationMin);
+  else if (optimize === 'cheapest') mapped.sort((a, b) => a.price - b.price);
+  else {
+    const minP = Math.min(...mapped.map(m => m.price));
+    const maxP = Math.max(...mapped.map(m => m.price));
+    const minT = Math.min(...mapped.map(m => m.totalDurationMin));
+    const maxT = Math.max(...mapped.map(m => m.totalDurationMin));
+    mapped.forEach(m => {
+      const pN = (m.price - minP) / Math.max(1, maxP - minP);
+      const tN = (m.totalDurationMin - minT) / Math.max(1, maxT - minT);
+      m._score = 0.5 * pN + 0.5 * tN;
+    });
+    mapped.sort((a, b) => (a._score ?? 0) - (b._score ?? 0));
+    mapped.forEach(m => delete m._score);
+  }
+
+  return mapped;
 }
 
+// routes
 app.post('/api/search', async (req, res) => {
   try {
     const q = req.body || {};
@@ -82,12 +114,12 @@ app.post('/api/search', async (req, res) => {
     const options = await searchAmadeus(q);
     res.json({ ok: true, options });
   } catch (e) {
-    console.error(e);
+    console.error('Search error:', e);
     res.status(500).json({ ok: false, error: e.message || 'Server error' });
   }
 });
 
-app.get('/health', (_, res) => res.json({ ok: true }));
+app.get('/health', (_req, res) => res.json({ ok: true }));
 
 const port = process.env.PORT || 8787;
 app.listen(port, () => console.log(`Amadeus API server running on :${port}`));
